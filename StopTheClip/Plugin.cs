@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Numerics;
 using System.Text.RegularExpressions;
 using Dalamud.Game;
 using Dalamud.Game.Command;
@@ -13,6 +14,10 @@ using FFXIVClientStructs.FFXIV.Client.System.Framework;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
+using CSCameraManager = FFXIVClientStructs.FFXIV.Client.Game.Control.CameraManager;
+using GameCamera = FFXIVClientStructs.FFXIV.Client.Game.Camera;
+using CameraControlMode = FFXIVClientStructs.FFXIV.Client.Game.CameraControlMode;
+using RenderCamera = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Camera;
 
 using StopTheClip.Structures;
 using MemoryManager.Structures;
@@ -20,26 +25,31 @@ using MemoryManager.Structures;
 
 namespace StopTheClip
 {
-    public unsafe class Plugin : IDalamudPlugin
+    public unsafe partial class Plugin : IDalamudPlugin
     {
         [PluginService] public static IDalamudPluginInterface? iPluginInterface { get; private set; } = null;
         [PluginService] public static IFramework? iFramework { get; private set; } = null;
         [PluginService] public static ICommandManager? CommandManager { get; private set; } = null;
         [PluginService] public static IClientState? ClientState { get; private set; } = null;
+        [PluginService] public static IObjectTable? ObjectTable { get; private set; } = null;
         [PluginService] public static IPartyList? PartyList { get; private set; } = null;
         [PluginService] public static ISigScanner? SigScanner { get; private set; } = null;
         [PluginService] public static IChatGui? ChatGui { get; private set; } = null;
+        [PluginService] public static IGameGui? GameGui { get; private set; } = null;
         [PluginService] public static ICondition? Condition { get; private set; } = null;
         [PluginService] public static IPluginLog? Log { get; private set; } = null;
-        [PluginService] public static IGameInteropProvider Interop { get; private set; } = null;
+        [PluginService] public static IGameInteropProvider Interop { get; private set; } = null!;
 
         public static SharedMemoryManager smm = new SharedMemoryManager();
+        public static Configuration Config { get; private set; } = new Configuration();
 
-        public string Name => "StopTheClip";
-        private const string CommandName = "/stoptheclip";
+        public string Name => "Fresh Set of Eyes";
+        private const string CommandName = "/fresheyes";
+        private const string LegacyCommandName = "/stoptheclip";
 
         private TargetSystem* targetSystem = TargetSystem.Instance();
-        private ControlSystemCameraManager* csCameraManager = null;
+        private const float NearClipOverride = 0.05f;
+        private float origNearClip = 0.1f;
         private HookManager hookManager = new HookManager();
 
         private bool isEnabled = false;
@@ -51,7 +61,12 @@ namespace StopTheClip
         {
             CommandManager!.AddHandler(CommandName, new CommandInfo(OnCommand)
             {
-                HelpMessage = "[enable|disable]"
+                HelpMessage = "Open the Fresh Set of Eyes settings. Add 'enable' or 'disable' to switch it on or off."
+            });
+            CommandManager!.AddHandler(LegacyCommandName, new CommandInfo(OnCommand)
+            {
+                HelpMessage = "Same as /fresheyes.",
+                ShowInHelp = false
             });
 
             ClientState!.Login += OnLogin;
@@ -68,6 +83,7 @@ namespace StopTheClip
         public void Dispose()
         {
             Stop();
+            DisposeFirstPerson();
             hookManager.DisposeFunctionHandles();
             smm.SetClose(SharedMemoryPlugins.StopTheClip);
             smm.Dispose();
@@ -81,6 +97,7 @@ namespace StopTheClip
             iPluginInterface!.UiBuilder.OpenMainUi -= ToggleUI;
 
             CommandManager!.RemoveHandler(CommandName);
+            CommandManager!.RemoveHandler(LegacyCommandName);
         }
 
         public void ToggleUI() => PluginUI.isVisible ^= true;
@@ -113,7 +130,8 @@ namespace StopTheClip
         private void DrawUI()
         {
             bool curEnabled = isEnabled;
-            PluginUI.Draw(ref curEnabled);
+            PluginUI.Draw(ref curEnabled, Config, DrawFirstPersonDebug);
+            DrawFirstPersonMarkers();
             if (curEnabled != isEnabled)
                 Toggle();
         }
@@ -130,7 +148,7 @@ namespace StopTheClip
             // Sets the lengths of the TargetSystem to 0 as they keep their size
             // even though the data is reset
             //----
-            targetSystem->ObjectFilterArray0.Length = 0;
+            targetSystem->TargetableObjectsOnScreen.Length = 0;
             targetSystem->ObjectFilterArray1.Length = 0;
             targetSystem->ObjectFilterArray2.Length = 0;
             targetSystem->ObjectFilterArray3.Length = 0;
@@ -139,11 +157,15 @@ namespace StopTheClip
                 ClipManagerResetNearClip();
         }
 
-        public static void PrintEcho(string message) => ChatGui!.Print($"[StopTheClip] {message}");
-        public static void PrintError(string message) => ChatGui!.PrintError($"[StopTheClip] {message}");
+        public static void PrintEcho(string message) => ChatGui!.Print($"[Fresh Set of Eyes] {message}");
+        public static void PrintError(string message) => ChatGui!.PrintError($"[Fresh Set of Eyes] {message}");
 
         private void Update(IFramework framework)
         {
+            frameDelta = (float)framework.UpdateDelta.TotalSeconds;
+            if (CameraUpdateHook == null)
+                TryCreateCameraUpdateHook();
+
             //----
             // if xivr is open check to see if its active
             // if so save the current active value and disable it
@@ -171,45 +193,74 @@ namespace StopTheClip
 
             if (isEnabled)
                 inCutscene = Condition![ConditionFlag.OccupiedInCutSceneEvent] || Condition![ConditionFlag.WatchingCutscene] || Condition![ConditionFlag.WatchingCutscene78];
+
+            inCombat = Condition![ConditionFlag.InCombat];
+            UpdateFirstPersonState();
+        }
+
+        private static RenderCamera* GetGameRenderCamera()
+        {
+            //----
+            // Only touch the main game camera (index 0), not cutscene/lobby cameras
+            //----
+            CSCameraManager* cameraManager = CSCameraManager.Instance();
+            if (cameraManager == null || cameraManager->ActiveCameraIndex != 0 || cameraManager->Camera == null)
+                return null;
+            return cameraManager->Camera->CameraBase.SceneCamera.RenderCamera;
         }
 
         private void ClipManagerSetNearClip()
         {
             //----
-            // Set the near clip and adjust the camera's forward offset
+            // Set the near clip, remembering the game's value so it can be restored
             //----
-            if (csCameraManager != null && csCameraManager->ActiveCameraIndex == 0 && csCameraManager->GameCamera != null)
-            {
-                csCameraManager->GameCamera->Camera.BufferData->NearClip = 0.05f;
-                csCameraManager->GameCamera->Camera.Position.Z += 0.1f; // Adjust the forward offset
-            }
+            RenderCamera* renderCamera = GetGameRenderCamera();
+            if (renderCamera == null)
+                return;
+            if (renderCamera->NearPlane != NearClipOverride)
+                origNearClip = renderCamera->NearPlane;
+            renderCamera->NearPlane = NearClipOverride;
         }
 
         private void ClipManagerResetNearClip()
         {
             //----
-            // Reset the near clip and camera's forward offset
+            // Restore the game's near clip
             //----
-            if (csCameraManager != null && csCameraManager->ActiveCameraIndex == 0 && csCameraManager->GameCamera != null)
-            {
-                csCameraManager->GameCamera->Camera.BufferData->NearClip = 0.1f;
-                csCameraManager->GameCamera->Camera.Position.Z -= 0.1f; // Reset the forward offset
-            }
-        }
-
-        private static class Signatures
-        {
-            internal const string g_ControlSystemCameraManager = "48 8D 0D ?? ?? ?? ?? F3 0F 10 4B ??";
-            internal const string RunGameTasks = "E8 ?? ?? ?? ?? 48 8B 8B C0 35 00 00";
+            RenderCamera* renderCamera = GetGameRenderCamera();
+            if (renderCamera == null)
+                return;
+            renderCamera->NearPlane = origNearClip;
         }
 
         private void Initialize()
         {
-            Interop.InitializeFromAttributes(this);
+            //----
+            // Carry settings over from when the plugin was called StopTheClip
+            //----
+            try
+            {
+                var configFile = iPluginInterface!.ConfigFile;
+                var legacyFile = new System.IO.FileInfo(System.IO.Path.Combine(configFile.DirectoryName!, "StopTheClip.json"));
+                if (!configFile.Exists && legacyFile.Exists)
+                    legacyFile.CopyTo(configFile.FullName);
+            }
+            catch (Exception e)
+            {
+                Log!.Warning(e, "Fresh Set of Eyes: could not carry over StopTheClip settings");
+            }
+            Config = iPluginInterface!.GetPluginConfig() as Configuration ?? new Configuration();
+            Config.Initialize(iPluginInterface!);
+
+            //----
+            // TaskManager::ExecuteAllTasks (formerly the RunGameTasks signature),
+            // resolved by FFXIVClientStructs so it tracks game patches
+            //----
+            RunGameTasksHook = Interop.HookFromAddress<RunGameTasksDg>((nint)TaskManager.MemberFunctionPointers.ExecuteAllTasks, RunGameTasksFn);
+            InitializeFirstPerson();
 
             hookManager.SetFunctionHandles(this);
             smm.SetOpen(SharedMemoryPlugins.StopTheClip);
-            csCameraManager = (ControlSystemCameraManager*)SigScanner!.GetStaticAddressFromSig(Signatures.g_ControlSystemCameraManager);
         }
 
         public void Start()
@@ -245,8 +296,7 @@ namespace StopTheClip
         //----
         // RunGameTasks
         //----
-        private delegate void RunGameTasksDg(UInt64 a, float* frameTiming);
-        [Signature(Signatures.RunGameTasks, DetourName = nameof(RunGameTasksFn))]
+        private delegate void RunGameTasksDg(TaskManager* taskManager, float* frameTiming);
         private Hook<RunGameTasksDg>? RunGameTasksHook = null;
 
         [HandleStatus("RunGameTasks")]
@@ -263,22 +313,49 @@ namespace StopTheClip
             }
         }
 
-        public unsafe void RunGameTasksFn(UInt64 a, float* frameTiming)
+        private void RunGameTasksFn(TaskManager* taskManager, float* frameTiming)
         {
-            if (isEnabled)
+            if (!isEnabled)
             {
-                uint taskCount = *(uint*)(a + 0x60);
-                for (int i = 0; i < taskCount; i++)
-                {
-                    if (i == 18)
-                        CheckVisibility();
-
-                    GameTask* task = (GameTask*)((UInt64)(i * 0x78) + *(UInt64*)(a + 0x58)); 
-                    task->vf1(frameTiming);
-                }
+                RunGameTasksHook!.Original(taskManager, frameTiming);
+                return;
             }
-            else
-                RunGameTasksHook!.Original(a, frameTiming);
+
+            //----
+            // Mirrors the game's loop, but fixes up model culling before task 18
+            //----
+            taskManager->UserData = frameTiming;
+            for (int i = 0; i < taskManager->TaskCount; i++)
+            {
+                //----
+                // The game marks characters the camera is close to as hidden.
+                // Undo that before rendering (task 18, as the plugin always
+                // has) and also at the start and end of the task loop, so the
+                // game's targeting code doesn't see them as hidden either.
+                //----
+                if (i == 0)
+                    CheckVisibilityAt(0);
+                if (i == 18)
+                {
+                    CheckVisibilityAt(1);
+                    LatePlaceCamera();
+                }
+
+                GameTask* task = (GameTask*)((byte*)taskManager->TaskList + (i * 0x78));
+                task->vf1(frameTiming);
+            }
+            CheckVisibilityAt(2);
+            LatePlaceCamera();
+        }
+
+        // How many hidden-by-camera characters were made visible at each point
+        // in the frame: [0] start of tasks, [1] before task 18, [2] end of tasks
+        private readonly long[] visibilityFlips = new long[3];
+        private int visibilitySite = 1;
+        private void CheckVisibilityAt(int site)
+        {
+            visibilitySite = site;
+            CheckVisibility();
         }
 
 
@@ -299,20 +376,23 @@ namespace StopTheClip
                     return;
 
                 if (model->CullType == ModelCullTypes.InsideCamera && ((byte)character->GameObject.TargetableStatus & 2) == 2)
+                {
                     model->CullType = ModelCullTypes.Visible;
+                    visibilityFlips[visibilitySite]++;
+                }
                 
                 DrawDataContainer* drawData = &character->DrawData;
                 if (drawData != null && !drawData->IsWeaponHidden)
                 {
-                    Structures.Model* mhWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.MainHand).DrawObject;
+                    Structures.Model* mhWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.MainHand).DrawData.DrawObject;
                     if (mhWeap != null)
                         mhWeap->CullType = ModelCullTypes.Visible;
 
-                    Structures.Model* ohWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.OffHand).DrawObject;
+                    Structures.Model* ohWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.OffHand).DrawData.DrawObject;
                     if (ohWeap != null)
                         ohWeap->CullType = ModelCullTypes.Visible;
 
-                    Structures.Model* fWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.Unk).DrawObject;
+                    Structures.Model* fWeap = (Structures.Model*)drawData->Weapon(DrawDataContainer.WeaponSlot.System).DrawData.DrawObject;
                     if (fWeap != null)
                         fWeap->CullType = ModelCullTypes.Visible;
                 }
@@ -336,7 +416,7 @@ namespace StopTheClip
         }
         private void CheckVisibility()
         {
-            IPlayerCharacter player = Plugin.ClientState!.LocalPlayer!;
+            IPlayerCharacter? player = Plugin.ObjectTable!.LocalPlayer;
             if (player == null)
                 return;
 
@@ -347,7 +427,7 @@ namespace StopTheClip
             // Check the player
             //----
             Character* character = (Character*)player.Address;
-            if (character != null && character != targetSystem->ObjectFilterArray0[0])
+            if (character != null && character != targetSystem->TargetableObjectsOnScreen[0])
                 CheckVisibilityInner(character);
 
             //----
@@ -355,11 +435,11 @@ namespace StopTheClip
             //----
             for (int i = 0; i < PartyList!.Length; i++)
             {
-                Dalamud.Game.ClientState.Objects.Types.IGameObject partyMember = PartyList[i]!.GameObject!;
+                Dalamud.Game.ClientState.Objects.Types.IGameObject? partyMember = PartyList[i]?.GameObject;
                 if (partyMember != null)
                 {
                     Character* partyCharacter = (Character*)partyMember.Address;
-                    if (character != null)
+                    if (partyCharacter != null)
                         CheckVisibilityInner(partyCharacter);
                 }
             }

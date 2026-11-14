@@ -1,35 +1,17 @@
-<Project Sdk="Dalamud.NET.Sdk/12.0.2">
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
     <Authors></Authors>
     <Company></Company>
-    <Version>0.0.1.1</Version>
-    <Description>StopTheClip</Description>
+    <Version>0.0.2.0</Version>
+    <Description>Fresh Set of Eyes</Description>
+    <AssemblyName>FreshSetOfEyes</AssemblyName>
     <Copyright></Copyright>
-	<PackageProjectUrl>https://github.com/astrodoobs/StopTheClip</PackageProjectUrl>
+    <PackageProjectUrl>https://github.com/astrodoobs/FreshEyes</PackageProjectUrl>
   </PropertyGroup>
 
   <PropertyGroup>
-    <TargetFramework>net9.0-windows7.0</TargetFramework>
     <Platforms>x64</Platforms>
     <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
-
-  <PropertyGroup>
-    <DalamudLibPath>$(appdata)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-  </PropertyGroup>
-  
-   <PropertyGroup Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))'">
-    <DalamudLibPath>$(DALAMUD_HOME)/</DalamudLibPath>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="DalamudPackager" Version="12.0.0" />
-  </ItemGroup>
-
 </Project>
